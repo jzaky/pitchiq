@@ -1,9 +1,11 @@
 import os
+import json
 import streamlit as st
 import pandas as pd
 import numpy as np
 from scipy.spatial import ConvexHull
 import plotly.graph_objects as go
+import anthropic
 
 st.set_page_config(page_title="PITCHIQ", layout="wide", initial_sidebar_state="collapsed")
 
@@ -38,15 +40,29 @@ def player_track(oid):
     d["sy"] = d["pitch_y"].rolling(5, min_periods=1, center=True).mean()
     return d
 
+def _count_sprints(mask, min_len=8, max_gap=4):
+    idx = np.where(mask)[0]
+    if len(idx) == 0:
+        return 0
+    clusters, start, prev = [], idx[0], idx[0]
+    for k in idx[1:]:
+        if k - prev <= max_gap:
+            prev = k
+        else:
+            clusters.append((start, prev)); start = prev = k
+    clusters.append((start, prev))
+    return sum(1 for a, b in clusters if (b - a + 1) >= min_len)
+
 def player_stats(d):
-    cons = d["frame_id"].diff() == 1
-    step = np.sqrt(d["sx"].diff()**2 + d["sy"].diff()**2)
-    raw = (step * FPS).where(cons)
-    tele = raw > 11.0
-    dist = float(step.where(cons & ~tele, 0).sum())
-    sp = raw.clip(upper=11.0)
-    top = float(np.nanmax(sp) * 3.6) if sp.notna().any() else 0.0
-    spr = int(((sp > 7.0) & (sp.shift(1) <= 7.0)).sum())
+    f = d["frame_id"].to_numpy()
+    xs = d["pitch_x"].to_numpy(); ys = d["pitch_y"].to_numpy()
+    valid = np.diff(f) == 1
+    disp = np.sqrt(np.diff(xs)**2 + np.diff(ys)**2)
+    dist = float(np.clip(np.where(valid, disp, 0.0), 0, 11.0 / FPS).sum())
+    speed = np.clip(np.where(valid, disp * FPS, np.nan), 0, 11.0)
+    speed_s = pd.Series(speed).rolling(5, min_periods=1, center=True).mean().to_numpy()
+    top = float(np.nanmax(speed_s) * 3.6) if np.isfinite(speed_s).any() else 0.0
+    spr = _count_sprints(np.nan_to_num(speed_s, nan=0.0) > 7.0)
     return dist, top, spr
 
 def profile(d):
@@ -91,6 +107,93 @@ def coaching_read(p, allp):
     else:
         adv = "Movement pattern is balanced. Next step is timing: arrive into space a beat later so the pass can be played in front, not to feet."
     return role, ch, s, f, adv
+
+# ---------------- AI development report (Claude) ----------------
+SYSTEM = """You are a senior football performance analyst writing a short player development note for a coach. You are given objective tracking data extracted by computer vision from a SINGLE short passage of play, around 10 to 15 seconds, filmed by one broadcast camera.
+
+Write for a coach who thinks in football terms, not in data. This is the most important rule:
+- Never mention raw coordinates, x or y values, axis numbers, or the words x axis or y axis. The coach must never see a number like "x 46.5, y 57.8".
+- Always describe position in natural football language, for example "on the right of midfield, around the halfway line", "tucked into the right channel", or "between the lines". Paint a picture of the player. Do not expose the data plumbing.
+- The note should read as smooth, well rounded coaching prose, not a readout of telemetry.
+
+Read the data with honesty and restraint:
+- This is a tiny sample. Never describe it as the player's overall ability, fitness, or character. Everything you say is about this passage only.
+- One camera means off-ball actions and parts of the pitch can be missing. Distances are while the player was tracked.
+- You do NOT have the ball, passes, shots, goals, or the opponent. Never invent events, scorelines, or tactical situations that are not in the data.
+- Where the data is too thin to judge something, say so plainly, and say what a longer sample would show.
+
+Be specific and useful. You may cite distance, speed, and sprint figures where they help, but position is always in words, never numbers. Do not use em dashes. Do not use emojis.
+
+Format the note in markdown with these sections:
+**Read of the passage** - one or two sentences on the player's likely role or zone and work rate.
+**Strengths in this passage** - 2 to 3 bullets.
+**To work on** - 2 to 3 bullets, honest that some needs more footage to confirm.
+**Suggested drills** - 2 to 3 concrete, named drills that match the read.
+
+Keep it tight, about 200 to 300 words."""
+
+LEGEND = """How to read the fields:
+- zone tells you where the player mostly operated. Describe it in football language, never as coordinates.
+- distance_m and top_speed_kmh are measured while the player was tracked.
+- sprints counts sustained runs above 25 km/h. A 0 with a high top speed means the player hit pace only in a brief burst, not a sustained sprint.
+- operating_range_m is the size in metres of the area the player covered, as length by width. Describe it as the area they covered, for example "around a 20 by 20 metre area".
+- share_of_clip_tracked near 1.0 means the player was visible almost the whole passage."""
+
+def _read_key():
+    try:
+        if "ANTHROPIC_API_KEY" in st.secrets:
+            return st.secrets["ANTHROPIC_API_KEY"]
+    except Exception:
+        pass
+    return os.environ.get("ANTHROPIC_API_KEY", "")
+
+def get_client():
+    key = _read_key()
+    return anthropic.Anthropic(api_key=key) if key else None
+
+def _third(x):
+    if x < 35.0:
+        return "first third"
+    if x < 70.0:
+        return "middle third"
+    return "final third"
+
+def _channel(y):
+    if y < 22.7:
+        return "left channel"
+    if y < 45.3:
+        return "central channel"
+    return "right channel"
+
+def llm_profile_from_track(d, psel, team_label):
+    frames = int(len(d))
+    clip_frames = int(df.frame_id.nunique())
+    return {
+        "player_id": int(d["object_id"].iloc[0]),
+        "team": team_label,
+        "seconds_tracked": round(frames / FPS, 1),
+        "share_of_clip_tracked": round(frames / clip_frames, 2),
+        "distance_m": round(psel["dist"], 1),
+        "top_speed_kmh": round(psel["top"], 1),
+        "sprints": int(psel["spr"]),
+        "zone": _channel(psel["my"]) + ", " + _third(psel["mx"]),
+        "operating_range_m": [round(float(d["sx"].max() - d["sx"].min()), 1),
+                              round(float(d["sy"].max() - d["sy"].min()), 1)],
+    }
+
+@st.cache_data(show_spinner=False)
+def generate_report(profile_json):
+    client = get_client()
+    if client is None:
+        return None
+    msg = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=900,
+        system=SYSTEM,
+        messages=[{"role": "user", "content": LEGEND + "\n\nPlayer profile:\n" + profile_json}],
+    )
+    return msg.content[0].text
+# ----------------------------------------------------------------
 
 def team_shape(t):
     sub = players[players.team_id == t]
@@ -196,12 +299,38 @@ pp2.metric("Top speed", f"{psel['top']:.1f} km/h")
 pp3.metric("Sprints", psel["spr"])
 pp4.metric("Team", team_choice.replace("Team ", ""))
 
-role, ch, strengths, focus, adv = coaching_read(psel, prof_all)
-st.markdown("#### AI coaching read")
-st.markdown("**Profile.** Resembles " + role + ", operating mainly in " + ch + ".")
-st.markdown("**Strengths.**\n" + "\n".join("- " + x for x in strengths))
-st.markdown("**Areas to improve.**\n" + "\n".join("- " + x for x in focus))
-st.info("Movement advice. " + adv)
+st.markdown("#### AI development report")
+
+def _show_rule_based():
+    role, ch, strengths, focus, adv = coaching_read(psel, prof_all)
+    st.markdown("**Profile.** Resembles " + role + ", operating mainly in " + ch + ".")
+    st.markdown("**Strengths.**\n" + "\n".join("- " + x for x in strengths))
+    st.markdown("**Areas to improve.**\n" + "\n".join("- " + x for x in focus))
+    st.info("Movement advice. " + adv)
+
+llm_prof = llm_profile_from_track(d, psel, team_choice)
+rkey = "report_" + str(sel)
+
+if get_client() is None:
+    st.caption("Add ANTHROPIC_API_KEY in this app's Settings, then Secrets, to switch on AI development reports. Showing the quick read for now.")
+    _show_rule_based()
+else:
+    if st.button("Generate development report for player " + str(sel)):
+        with st.spinner("Analysing the player..."):
+            try:
+                st.session_state[rkey] = generate_report(json.dumps(llm_prof, sort_keys=True))
+                st.session_state.pop(rkey + "_err", None)
+            except Exception as e:
+                st.session_state[rkey] = None
+                st.session_state[rkey + "_err"] = str(e)[:160]
+    if st.session_state.get(rkey):
+        st.markdown(st.session_state[rkey])
+    elif st.session_state.get(rkey + "_err"):
+        st.warning("Report could not be generated: " + st.session_state[rkey + "_err"] + ". Showing the quick read instead.")
+        _show_rule_based()
+    else:
+        st.caption("Click the button above to generate this player's AI development report. The quick read is shown below until then.")
+        _show_rule_based()
 
 st.markdown("#### Movement heatmap")
 hx, hy = d["sx"], d["sy"]
